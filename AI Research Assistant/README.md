@@ -32,10 +32,6 @@ planner           — LLM plans paper sections from search results
   ↓
 writer            — LLM writes the full paper
   ↓
-evaluator         — LLM reviews quality (yes/no + feedback)
-  ↓ (if needs improvement and revisions < max)
-rewriter          — LLM rewrites based on feedback ──→ back to evaluator
-  ↓ (approved or max revisions reached)
 save_paper        — Returns final paper
   ↓
 END
@@ -99,4 +95,6 @@ streamlit run app.py
 
 ---
 
-Built as a portfolio project demonstrating agentic AI system design.
+## Output Demo
+<img width="1099" height="638" alt="image" src="https://github.com/user-attachments/assets/9e4b8df3-289e-4f62-ae22-af2a92928200" />
+
