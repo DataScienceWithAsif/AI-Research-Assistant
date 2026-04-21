@@ -1,188 +1,322 @@
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.runnables import RunnableParallel, RunnableLambda
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import StateGraph, START, END
-from langchain_groq import ChatGroq
-import os, time, re
-from typing import List, Generator
-from typing_extensions import TypedDict
+"""
+graph.py — AI Research Assistant Pipeline
+LangGraph-based multi-agent research paper generator
+"""
+
+import os
 from dotenv import load_dotenv
+from typing import List
+from typing_extensions import TypedDict
+
+from pydantic import BaseModel, Field
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.runnables import RunnableParallel
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_groq import ChatGroq
+from langgraph.graph import StateGraph, START, END
 
 load_dotenv()
 
-# ──────────────────────────────────────────────
-# ⚡ Model & Tools Setup
-# ──────────────────────────────────────────────
-groq_llm = ChatGroq(
-    model="llama-3.3-70b-versatile", 
-    temperature=0.3,
-    max_tokens=1000,
-    timeout=30,  # 30-second timeout
-    max_retries=2
-)
-web_search = TavilySearchResults(max_results=3)
+# ─────────────────────────────────────────────
+# LLM & Tools Setup
+# ─────────────────────────────────────────────
+
+groq_llm = ChatGroq(model="llama-3.3-70b-versatile")
+web_search = TavilySearchResults(max_results=2)
+
+# ─────────────────────────────────────────────
+# Structured Output Schemas
+# ─────────────────────────────────────────────
+
+class Queries(BaseModel):
+    queries: List[str] = Field(
+        description="3–6 search queries to gather web context for the given research topic"
+    )
+
+class Outlines(BaseModel):
+    Sections: List[str] = Field(
+        description="Main section headings for the research paper"
+    )
+
+# ─────────────────────────────────────────────
+# Graph State
+# ─────────────────────────────────────────────
 
 class GraphState(TypedDict):
-    query: str
-    optimized_query: str
-    search_results: List[str]
+    topic: str
+    queries: Queries
     context: str
-    answer: str
-    sources: List[str]
+    Sections: Outlines
+    paper: str
 
-# ──────────────────────────────────────────────
-# 🔹 Nodes
-# ──────────────────────────────────────────────
-def optimize_query(state: GraphState):
-    try:
-        query_text = state.get("query") or "latest AI trends"
-        response = groq_llm.invoke([
-            SystemMessage(content="Rewrite the user query into a highly precise search query."),
-            HumanMessage(content=query_text)
-        ])
-        return {"optimized_query": response.content.strip()}
-    except Exception as e:
-        print(f"Optimization Error: {e}")
-        # Fallback so the graph continues even if LLM fails
-        return {"optimized_query": state.get("query")}
+# ─────────────────────────────────────────────
+# LLM Variants with Structured Output
+# ─────────────────────────────────────────────
 
-def web_search_node(state: GraphState):
-    # Using both the optimized and original query for broader coverage
-    queries = [state["optimized_query"], f"{state['query']} latest developments"]
-    merged = []
-    for q in queries:
-        try:
-            results = web_search.invoke(q)
-            merged.extend([r["content"] for r in results if r.get("content")])
-        except Exception:
-            continue
-    return {"search_results": merged[:8]}
+llm_queries     = groq_llm.with_structured_output(Queries)
+llm_planning    = groq_llm.with_structured_output(Outlines)
 
-def compress_context(state: GraphState):
-    results = state.get("search_results", [])
-    context = "\n---\n".join(results)
-    return {"context": context[:4000]} # Stay within LLM context limits
+# ─────────────────────────────────────────────
+# Node: Query Generator
+# ─────────────────────────────────────────────
 
-def generate_answer(state: GraphState):
-    response = groq_llm.invoke([
-        SystemMessage(content="""You are a Lead AI Researcher. 
-        Provide a deep-dive technical report with:
-        - Professional bullet points
-        - Clear, bold headings
-        - A concise conclusion
-        Keep it between 400-600 words."""),
-        HumanMessage(content=f"Query: {state['query']}\n\nContext: {state['context']}")
+def query_generator(state: GraphState):
+    """Generate 3–6 search queries for the given topic."""
+    topic = state["topic"]
+
+    system = (
+        "You are an expert at generating precise web search queries. "
+        "Given a research topic, produce 3–6 queries that together will surface "
+        "the most relevant and up-to-date information needed to write a professional research paper."
+    )
+
+    response = llm_queries.invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=f"Topic: {topic}")
     ])
-    return {
-        "answer": response.content, 
-        "sources": state.get("search_results", [])[:3]
-    }
 
-# ──────────────────────────────────────────────
-# 🧾 HTML Generator Helper
-# ──────────────────────────────────────────────
-def convert_to_html(answer: str, query: str, sources: List[str]) -> str:
-    # Clean up the answer text for HTML rendering
-    formatted_answer = answer.replace("\n", "<br>")
-    
-    source_list = "".join([f"<li>{s[:150]}...</li>" for s in sources])
-    
-    return f"""
-    <html>
-    <head>
-        <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: auto; padding: 20px; background-color: #f4f7f6; }}
-            .container {{ background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-            h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-            .content {{ margin-top: 20px; }}
-            .sources {{ margin-top: 30px; background: #ecf0f1; padding: 20px; border-radius: 5px; font-size: 0.9em; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Research Report: {query}</h1>
-            <div class="content">{formatted_answer}</div>
-            <div class="sources">
-                <h3>Sources Consulted</h3>
-                <ul>{source_list}</ul>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+    return {"queries": response}
 
-# ──────────────────────────────────────────────
-# 🧠 Graph Construction
-# ──────────────────────────────────────────────
-builder = StateGraph(GraphState)
-builder.add_node("optimize", optimize_query)
-builder.add_node("search", web_search_node)
-builder.add_node("compress", compress_context)
-builder.add_node("answer", generate_answer)
+# ─────────────────────────────────────────────
+# Node: Web Search (parallel)
+# ─────────────────────────────────────────────
 
-builder.add_edge(START, "optimize")
-builder.add_edge("optimize", "search")
-builder.add_edge("search", "compress")
-builder.add_edge("compress", "answer")
-builder.add_edge("answer", END)
+def _search_one(query: str) -> List[str]:
+    """Run a single Tavily search and return result texts."""
+    results = web_search.invoke(query)
+    return [r["content"] for r in results]
 
-memory = MemorySaver()
-graph = builder.compile(checkpointer=memory)
 
-# ──────────────────────────────────────────────
-# 📡 Streaming Engine
-# ──────────────────────────────────────────────
-NODE_LABELS = {
-    "optimize": "🔍 Refining Research Strategy...",
-    "search": "🌐 Scanning Global Databases...",
-    "compress": "📚 Synthesizing Knowledge...",
-    "answer": "✍️ Authoring Final Report..."
-}
+def webSearch(state: GraphState):
+    """Run all queries in parallel and merge results into one context string."""
+    queries_list = state["queries"].queries
 
-def run_graph_streaming(query: str, thread_id: str):
-    config = {"configurable": {"thread_id": thread_id}}
-    
-    # 🌟 CRITICAL: Yield a heartbeat immediately
-    yield {"type": "node", "node": "start", "label": "🚀 Dispatching Agents...", "data": {}}
-    
-    try:
-        # Pass the initial state
-        for event in graph.stream({"query": query}, config=config, stream_mode="updates"):
-            if not event or not isinstance(event, dict):
-                continue
-            
-            node = list(event.keys())[0]
-            data = event[node]
+    # Build a RunnableParallel map dynamically from available queries
+    tasks = {f"q{i}": (lambda q: lambda _: _search_one(q))(q) for i, q in enumerate(queries_list)}
+    parallel = RunnableParallel(**tasks)
+    results  = parallel.invoke(queries_list)  # input is unused by lambdas
 
-            if isinstance(data, dict):
-                yield {
-                    "type": "node",
-                    "node": node,
-                    "label": NODE_LABELS.get(node, node),
-                    "data": data
-                }
-        
-        # ── Final Extraction (The fix for the 'str' object error) ──
-        state_snapshot = graph.get_state(config)
-        
-        # We access the dictionary of state variables using .values
-        final_values = state_snapshot.values if hasattr(state_snapshot, 'values') else {}
+    all_texts = []
+    for key in sorted(results.keys()):
+        all_texts.extend(results[key])
 
-        if final_values.get("answer"):
-            html_content = convert_to_html(
-                final_values["answer"],
-                final_values.get("query", query),
-                final_values.get("sources", [])
-            )
+    context = "\n\n".join(all_texts)
+    return {"context": context}
 
-            yield {
-                "type": "done",
-                "answer": final_values["answer"],
-                "sources": final_values.get("sources", []),
-                "html": html_content
-            }
-            
-    except Exception as e:
-        print(f"Graph Streaming Error: {e}")
-        raise e
+# ─────────────────────────────────────────────
+# Node: Planner
+# ─────────────────────────────────────────────
+
+def planner(state: GraphState):
+    """Decide the section structure of the research paper."""
+    topic   = state["topic"]
+    context = state["context"]
+
+    system = (
+        "You are a research architect. Based on the topic and web-gathered context, "
+        "decide the best section headings for a professional research paper. "
+        "Return only the list of section titles — no descriptions."
+    )
+
+    response = llm_planning.invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=f"Topic: {topic}\n\nContext:\n{context}")
+    ])
+
+    return {"Sections": response}
+
+# ─────────────────────────────────────────────
+# Node: Writer
+# ─────────────────────────────────────────────
+
+def writer(state: GraphState):
+    """Write the full research paper in Markdown."""
+    topic    = state["topic"]
+    sections = state["Sections"].Sections
+    context  = state["context"]
+
+    system = (
+        "You are a professional academic writer. Write a complete, well-structured research paper "
+        "in Markdown format using the provided sections and context. "
+        "Each section should be thorough, accurate, and flow naturally. "
+        "Output ONLY the research paper — no commentary, no preamble."
+    )
+
+    response = groq_llm.invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=(
+            f"Topic: {topic}\n\n"
+            f"Sections: {sections}\n\n"
+            f"Context:\n{context}"
+        ))
+    ])
+
+    return {"paper": response.content}
+
+# ─────────────────────────────────────────────
+# Node: HTML Formatter (replaces downable_html)
+# ─────────────────────────────────────────────
+
+def html_formatter(state: GraphState):
+    """Convert Markdown paper to a styled HTML string stored in state."""
+    import re
+
+    paper = state["paper"]
+
+    # Simple Markdown → HTML conversion
+    def md_to_html(md: str) -> str:
+        lines   = md.split("\n")
+        html    = []
+        in_ul   = False
+
+        for line in lines:
+            # Headings
+            if line.startswith("### "):
+                if in_ul: html.append("</ul>"); in_ul = False
+                html.append(f"<h3>{line[4:]}</h3>")
+            elif line.startswith("## "):
+                if in_ul: html.append("</ul>"); in_ul = False
+                html.append(f"<h2>{line[3:]}</h2>")
+            elif line.startswith("# "):
+                if in_ul: html.append("</ul>"); in_ul = False
+                html.append(f"<h1>{line[2:]}</h1>")
+            # Bullet list
+            elif line.startswith("- ") or line.startswith("* "):
+                if not in_ul: html.append("<ul>"); in_ul = True
+                content = line[2:]
+                content = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", content)
+                html.append(f"  <li>{content}</li>")
+            # Blank line
+            elif line.strip() == "":
+                if in_ul: html.append("</ul>"); in_ul = False
+                html.append("")
+            # Normal paragraph line
+            else:
+                if in_ul: html.append("</ul>"); in_ul = False
+                line = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line)
+                line = re.sub(r"\*(.+?)\*",     r"<em>\1</em>",         line)
+                html.append(f"<p>{line}</p>")
+
+        if in_ul:
+            html.append("</ul>")
+
+        return "\n".join(html)
+
+    body_html = md_to_html(paper)
+
+    full_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Research Paper</title>
+  <style>
+    /* ── Reset ── */
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+    body {{
+      font-family: 'Georgia', 'Times New Roman', serif;
+      background: #f4f1eb;
+      color: #1a1a1a;
+      padding: 40px 20px 80px;
+      line-height: 1.8;
+    }}
+
+    /* ── Paper Card ── */
+    .paper {{
+      max-width: 860px;
+      margin: 0 auto;
+      background: #fff;
+      border-radius: 4px;
+      box-shadow: 0 4px 30px rgba(0,0,0,0.12);
+      padding: 60px 70px;
+    }}
+
+    /* ── Typography ── */
+    h1 {{
+      font-size: 2rem;
+      font-weight: 700;
+      color: #111;
+      border-bottom: 3px solid #2563eb;
+      padding-bottom: 12px;
+      margin-bottom: 28px;
+    }}
+    h2 {{
+      font-size: 1.35rem;
+      font-weight: 700;
+      color: #1d4ed8;
+      margin: 36px 0 10px;
+    }}
+    h3 {{
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #374151;
+      margin: 24px 0 8px;
+    }}
+    p {{
+      margin: 10px 0;
+      font-size: 1rem;
+      text-align: justify;
+    }}
+    ul {{
+      margin: 10px 0 10px 24px;
+    }}
+    li {{
+      margin: 4px 0;
+    }}
+    strong {{ color: #111; }}
+
+    /* ── Footer Meta ── */
+    .meta {{
+      text-align: center;
+      font-size: 0.8rem;
+      color: #9ca3af;
+      margin-top: 50px;
+      border-top: 1px solid #e5e7eb;
+      padding-top: 16px;
+    }}
+
+    @media (max-width: 640px) {{
+      .paper {{ padding: 30px 22px; }}
+      h1 {{ font-size: 1.5rem; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="paper">
+    {body_html}
+    <div class="meta">Generated by AI Research Assistant &bull; Powered by LangGraph + Groq</div>
+  </div>
+</body>
+</html>"""
+
+    return {"paper": paper, "html_output": full_html}
+
+# ─────────────────────────────────────────────
+# Build & Compile Graph
+# ─────────────────────────────────────────────
+
+class ExtendedState(GraphState, total=False):
+    html_output: str
+
+
+def build_graph():
+    builder = StateGraph(ExtendedState)
+
+    builder.add_node("query_generator", query_generator)
+    builder.add_node("webSearch",       webSearch)
+    builder.add_node("planner",         planner)
+    builder.add_node("writer",          writer)
+    builder.add_node("html_formatter",  html_formatter)
+
+    builder.add_edge(START,             "query_generator")
+    builder.add_edge("query_generator", "webSearch")
+    builder.add_edge("webSearch",       "planner")
+    builder.add_edge("planner",         "writer")
+    builder.add_edge("writer",          "html_formatter")
+    builder.add_edge("html_formatter",  END)
+
+    return builder.compile()
+
+
+graph = build_graph()
